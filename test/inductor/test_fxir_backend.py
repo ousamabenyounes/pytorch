@@ -28,6 +28,7 @@ from torch._inductor.codegen.wrapper import PythonWrapperCodegen, UnbackedSymbol
 from torch._inductor.codegen.wrapper_fxir import (
     FxConverter,
     replace_floor_div,
+    solve_compound_input,
     WrapperFxCodegen,
 )
 from torch._inductor.test_case import TestCase as InductorTestCase
@@ -1372,6 +1373,95 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         offsets = torch.tensor([0, 3, 7, length], dtype=torch.int64, device=self.device)
 
         self.check(TestModule(), (data, offsets))
+
+    def test_compound_symint_graph_input(self):
+        """A compound symbolic graph input binds to a single placeholder.
+
+        The branches close over 2 * y.shape[0] + 1, so the lifted argument
+        reaches the converter as a sympy.Add rather than a single Symbol.
+        """
+
+        class M(torch.nn.Module):
+            def forward(self, x, y):
+                a = 2 * y.shape[0] + 1
+
+                def true_fn(t):
+                    return t + a
+
+                # Identical branches would share one Triton kernel between
+                # two separately converted subgraphs, which FX conversion
+                # cannot resolve.
+                def false_fn(t):
+                    return t + a + 1
+
+                return torch.cond(x.shape[0] > 5, true_fn, false_fn, (x,))
+
+        inp = tuple(torch.randn(numel, device=self.device) for numel in (8, 4))
+        gm = self.check(M(), inp, dynamic_shapes=({0: Dim.DYNAMIC}, {0: Dim.DYNAMIC}))
+
+        # The lifted argument is a placeholder of the branch subgraphs, not of
+        # the parent graph. Check each branch on its own: one symbolic
+        # placeholder holding the whole expression, so neither branch fell back
+        # to taking the constituent symbol instead.
+        branches = [
+            submod
+            for name, submod in gm.named_modules()
+            if name and isinstance(submod, torch.fx.GraphModule)
+        ]
+        self.assertEqual(len(branches), 2, "expected the two cond subgraphs")
+        for branch in branches:
+            symbolic = [
+                node.meta["val"]
+                for node in branch.graph.find_nodes(op="placeholder")
+                if isinstance(node.meta.get("val"), torch.SymInt)
+            ]
+            self.assertEqual(len(symbolic), 1)
+            expr = symbolic[0].node.expr
+            (sym,) = expr.free_symbols
+            self.assertEqual(expr, 2 * sym + 1)
+
+
+class TestSolveCompoundInput(InductorTestCase):
+    """
+    Tests for recovering a symbol from the expression a graph input binds.
+    """
+
+    def test_solve_affine(self):
+        # The compound-input case: the inverse is exact for every bound value,
+        # including negative ones, which a tensor size never takes.
+        s = sympy.Symbol("s", integer=True)
+        value = sympy.Symbol("value", integer=True)
+
+        solved = solve_compound_input(2 * s + 1, value, s)
+
+        self.assertEqual(solved.subs(value, 7), 3)
+        self.assertEqual(solved.subs(value, -5), -3)
+
+    def test_no_solve_nonlinear(self):
+        # try_solve only isolates a symbol that appears linearly, so it never
+        # returns one of the two roots here.
+        s = sympy.Symbol("s", integer=True)
+        value = sympy.Symbol("value", integer=True)
+
+        self.assertIsNone(solve_compound_input(s**2, value, s))
+
+    def test_no_solve_denominator_may_be_zero(self):
+        # Solving gives value/t, which determines nothing when t is zero.
+        s = sympy.Symbol("s", integer=True)
+        t = sympy.Symbol("t", integer=True)
+        value = sympy.Symbol("value", integer=True)
+
+        self.assertIsNone(solve_compound_input(t * s, value, s))
+
+    def test_solve_denominator_nonzero(self):
+        # Same expression, but t is now provably nonzero, so it is accepted.
+        s = sympy.Symbol("s", integer=True)
+        t = sympy.Symbol("t", integer=True, positive=True)
+        value = sympy.Symbol("value", integer=True)
+
+        solved = solve_compound_input(t * s, value, s)
+
+        self.assertEqual(solved.subs({value: 12, t: 4}), 3)
 
 
 class TestReplaceFloorDiv(InductorTestCase):
