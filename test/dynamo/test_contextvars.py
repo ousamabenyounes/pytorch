@@ -758,7 +758,9 @@ class TestContextVars(TestCase):
         self.assertEqual(out, torch.tensor(1))
         self.assertEqual(cv.get().tag, "new")
 
-    def test_contextvar_mutation_with_allow_in_graph_errors(self):
+    def test_contextvar_mutation_with_allow_in_graph_stale_read(self):
+        # Opaque runtime callables observe pre-mutation cv state (deferred replay).
+        # Same staleness semantics as globals and random state.
         cv = contextvars.ContextVar("allow_in_graph_cv", default="old")
 
         @torch.compiler.allow_in_graph
@@ -770,13 +772,9 @@ class TestContextVars(TestCase):
             cv.set("new")
             return x + read_cv()
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            "ContextVar\\.set\\(\\)/reset\\(\\) with opaque runtime function calls",
-        ):
-            fn(torch.tensor(0))
+        self.assertEqual(fn(torch.tensor(0)), torch.tensor(2))
 
-    def test_contextvar_mutation_with_nonstrict_trace_errors(self):
+    def test_contextvar_mutation_with_nonstrict_trace_stale_read(self):
         cv = contextvars.ContextVar("nonstrict_trace_cv", default="old")
 
         @torch.compiler.nonstrict_trace
@@ -791,13 +789,9 @@ class TestContextVars(TestCase):
             finally:
                 cv.reset(token)
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            "ContextVar\\.set\\(\\)/reset\\(\\) with opaque runtime function calls",
-        ):
-            fn(torch.tensor(0))
+        self.assertEqual(fn(torch.tensor(0)), torch.tensor(2))
 
-    def test_contextvar_mutation_with_leaf_function_errors(self):
+    def test_contextvar_mutation_with_leaf_function_stale_read(self):
         cv = contextvars.ContextVar("leaf_function_cv", default="old")
 
         from torch._dynamo.decorators import leaf_function
@@ -818,11 +812,7 @@ class TestContextVars(TestCase):
             finally:
                 cv.reset(token)
 
-        with self.assertRaisesRegex(
-            torch._dynamo.exc.Unsupported,
-            "ContextVar\\.set\\(\\)/reset\\(\\) with opaque runtime function calls",
-        ):
-            fn(torch.tensor(0))
+        self.assertEqual(fn(torch.tensor(0)), torch.tensor(2))
 
     def test_mutated_original_object_survives_rebind(self):
         cv = contextvars.ContextVar("mutated_old_object", default=None)

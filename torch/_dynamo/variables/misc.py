@@ -2768,6 +2768,10 @@ class ContextVarVariable(VariableTracker):
             from_tracing_set=True,
         )
         tx.output.side_effects.record_contextvar_set(self, args[0], token)
+        real_value = args[0].get_real_python_backed_value()
+        if real_value is not NO_SUCH_SUBOBJ:
+            real_token = self.cv_obj.set(real_value)
+            tx.output.add_cleanup_hook(lambda: self.cv_obj.reset(real_token))
         return token
 
     def _handle_reset(
